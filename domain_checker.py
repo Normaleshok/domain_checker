@@ -1,66 +1,26 @@
+import csv
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 import socket
 import requests
-from tqdm import tqdm  # Импорт библиотеки для прогресс-бара
-import logging
-logging.basicConfig(filename='check.log', level=logging.INFO, encoding='utf-8')
+from tqdm.auto import tqdm
 
-def process_domains(input_file, output_file=None, max_workers=10, batch_size=5000):
-    """Обработка доменов пакетами"""
-    def read_domains(filename):
-        encodings = ['utf-8', 'utf-8-sig', 'cp1251', 'cp866']
-        for enc in encodings:
-            try:
-                with open(filename, 'r', encoding=enc) as file:
-                    return [line.strip() for line in file if line.strip()]
-            except UnicodeDecodeError:
-                continue
-        raise ValueError("Не удалось прочитать файл")
-
-    try:
-        all_domains = read_domains(input_file)
-    except Exception as e:
-        print(f"Ошибка чтения файла: {e}")
-        return
-
-    print(f"[ПРОВЕРКА] {len(all_domains)} ДОМЕНОВ...")
-
-    start_time = time.time()
-    processed = 0
-
-    # Разбиваем на пакеты
-    domain_batches = [all_domains[i:i + batch_size]
-                      for i in range(0, len(all_domains), batch_size)]
-
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Используем tqdm для отображения прогресса
-        for current_batch in tqdm(domain_batches, desc="Обработка доменов"):
-            try:
-                results = list(executor.map(check_domain_availability, current_batch))
-                processed += len(results)
-
-                if output_file:
-                    with open(output_file, 'a', encoding='utf-8') as output_f:
-                        for result in results:
-                            output_f.write(f"{result['domain']},{result['dns']},{result['http']}\n")
-
-                print(f"\rОбработано: {processed}/{len(all_domains)} | Время: {time.time() - start_time:.2f} сек", end="")
-
-            except (socket.gaierror, requests.exceptions.RequestException) as e:
-                print(f"\nОшибка в пакете: {e}")
-                continue
-            except KeyboardInterrupt as interrupt:
-                print("\nПрерывание пользователем. Частичные результаты сохранены.")
-                break
-
-    print(f"\nЗавершено. Всего обработано {processed} доменов за {time.time() - start_time:.2f} секунд")
+def load_domains(filename):
+    """Загрузка доменов из файла с обработкой кодировок"""
+    encodings = ['utf-8', 'utf-8-sig', 'cp1251', 'cp866']
+    for enc in encodings:
+        try:
+            with open(filename, 'r', encoding=enc) as f:
+                return {line.strip().lower() for line in f if line.strip()}
+        except UnicodeDecodeError:
+            continue
+    raise ValueError(f"Не удалось прочитать файл {filename}")
 
 def check_domain_availability(domain):
     """Проверка доступности домена"""
     result = {'domain': domain, 'dns': None, 'http': None}
 
-    # DNS проверка
     try:
         socket.setdefaulttimeout(5)
         socket.gethostbyname(domain)
@@ -68,7 +28,6 @@ def check_domain_availability(domain):
     except socket.gaierror:
         result['dns'] = False
 
-    # HTTP проверка только если DNS разрешился
     if result['dns']:
         for protocol in ['https', 'http']:
             try:
@@ -85,14 +44,75 @@ def check_domain_availability(domain):
 
     return result
 
+def process_domains(main_file, whitelist_file, output_file, max_workers=10, batch_size=5000):
+    """Основная функция обработки"""
+    try:
+        print("Загрузка доменов...")
+        main_domains = load_domains(main_file)
+        whitelist = load_domains(whitelist_file)
+
+        # Находим пересечение доменов
+        domains_to_check = main_domains & whitelist
+        print(f"[ПРОВЕРКА] Найдено {len(domains_to_check)} совпадений с вайт-листом")
+
+        if not domains_to_check:
+            print("Нет доменов для проверки")
+            return
+
+        # Конвертируем в список для сохранения порядка
+        domains_list = list(domains_to_check)
+
+        # Разбиваем на пакеты
+        batches = [domains_list[i:i + batch_size]
+                   for i in range(0, len(domains_list), batch_size)]
+
+        start_time = time.time()
+        processed = 0
+
+        # Создаем CSV файл
+        with open(output_file, 'w', newline='', encoding='utf-8') as csvfile:
+            fieldnames = ['domain', 'dns', 'http']
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                for batch in tqdm(batches, desc="Обработка"):
+                    try:
+                        results = list(executor.map(check_domain_availability, batch))
+                        processed += len(results)
+
+                        # Записываем результаты в CSV
+                        for result in results:
+                            writer.writerow(result)
+
+                        print(f"\rОбработано: {processed}/{len(domains_list)}", end="")
+                    except Exception as e:
+                        print(f"\nОшибка в пакете: {e}")
+                        continue
+
+        print(f"\nЗавершено. Результаты сохранены в {output_file}")
+        print(f"Общее время: {time.time() - start_time:.2f} секунд")
+
+    except Exception as e:
+        print(f"Ошибка: {str(e)}")
+        sys.exit(1)
+
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("input_file", help="Файл с доменами")
-    parser.add_argument("-o", "--output", help="Файл для результатов")
+    parser = argparse.ArgumentParser(description="Проверка доменов по вайт-листу")
+    parser.add_argument("main_file", help="Основной файл с доменами")
+    parser.add_argument("whitelist", help="Файл вайт-листа")
+    parser.add_argument("-o", "--output", required=True, help="Файл для результатов (CSV)")
     parser.add_argument("-w", "--workers", type=int, default=10, help="Количество потоков")
     parser.add_argument("-b", "--batch", type=int, default=5000, help="Размер пакета")
 
     args = parser.parse_args()
-    process_domains(args.input_file, args.output, args.workers, args.batch)
+
+    process_domains(
+        args.main_file,
+        args.whitelist,
+        args.output,
+        args.workers,
+        args.batch
+    )
